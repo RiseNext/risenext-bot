@@ -42,7 +42,10 @@ export async function handleWebhook(req, res) {
       await handleInstagram(body);
     }
   } catch (error) {
-    console.error("Webhook processing error:", error.response?.data || error.message);
+    console.error(
+      "Webhook processing error:",
+      error.response?.data || error.message
+    );
   }
 }
 
@@ -84,6 +87,22 @@ function selectedFinalOption(selectedId = "") {
   return selectedId.startsWith("option_") || selectedId === "talk_team";
 }
 
+function isMainMenuTrigger(normalized = "") {
+  return ["hi", "hello", "hey", "menu", "start", "help"].includes(normalized);
+}
+
+async function saveWhatsAppLead({ from, contact, text, selectedId, service, message }) {
+  await upsertLead({
+    channel: "whatsapp",
+    customerId: from,
+    name: contact?.profile?.name,
+    phone: from,
+    incomingText: text || selectedId || "Hi",
+    selectedService: service?.label || selectedId || "Main Menu",
+    payload: message
+  });
+}
+
 async function handleWhatsApp(body) {
   for (const entry of body.entry || []) {
     for (const change of entry.changes || []) {
@@ -105,41 +124,51 @@ async function handleWhatsApp(body) {
         company.services.find((s) => s.key === serviceKey) ||
         findService(text);
 
-      await upsertLead({
-        channel: "whatsapp",
-        customerId: from,
-        name: contact?.profile?.name,
-        phone: from,
-        incomingText: text || selectedId,
-        selectedService: service?.label || selectedId || "Main Menu",
-        payload: message
+      await saveWhatsAppLead({
+        from,
+        contact,
+        text,
+        selectedId,
+        service,
+        message
       });
 
+      // FAST REPLY: first message/menu should not call OpenAI
+      if (isMainMenuTrigger(normalized) && !selectedId) {
+        await sendWhatsAppMainMenu(from);
+        continue;
+      }
+
+      // Final option selected
       if (selectedFinalOption(selectedId)) {
         await sendWhatsAppText(from, thankYouMessage());
         continue;
       }
 
+      // Service selected or typed
       if (service) {
         await sendWhatsAppServiceMenu(from, service);
         continue;
       }
 
-      // Any message from customer should show menu.
+      // If OpenAI is disabled, always show menu
       if (!process.env.OPENAI_API_KEY) {
         await sendWhatsAppMainMenu(from);
         continue;
       }
 
-      // Optional AI fallback if OpenAI key is enabled.
-      if (process.env.OPENAI_API_KEY) {
-        const aiReply = await askRiseNextAI(text || "Customer needs assistance");
+      // OpenAI only for custom queries
+      try {
+        const aiReply = await askRiseNextAI(
+          text || "Customer needs assistance with Rise Next Solutions"
+        );
+
         await sendWhatsAppText(from, aiReply);
         await sendWhatsAppMainMenu(from);
-        continue;
+      } catch (error) {
+        console.error("OpenAI fallback error:", error.response?.data || error.message);
+        await sendWhatsAppMainMenu(from);
       }
-
-      await sendWhatsAppMainMenu(from);
     }
   }
 }
@@ -152,8 +181,8 @@ async function handleInstagram(body) {
 
       if (!senderId || !text) continue;
 
-      const service = findService(text);
       const normalized = normalizeText(text);
+      const service = findService(text);
 
       let reply = buildMainMenuText();
 
@@ -161,8 +190,17 @@ async function handleInstagram(body) {
         reply = `${service.label}\n\n${service.details}`;
       }
 
-      if (process.env.OPENAI_API_KEY && !service && !["hi", "hello", "menu", "start"].includes(normalized)) {
-        reply = await askRiseNextAI(text);
+      if (
+        process.env.OPENAI_API_KEY &&
+        !service &&
+        !isMainMenuTrigger(normalized)
+      ) {
+        try {
+          reply = await askRiseNextAI(text);
+        } catch (error) {
+          console.error("Instagram OpenAI error:", error.response?.data || error.message);
+          reply = buildMainMenuText();
+        }
       }
 
       await upsertLead({
